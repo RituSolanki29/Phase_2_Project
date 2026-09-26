@@ -1,0 +1,8 @@
+data/borg_traces_data.csvdata/borg_traces_data.csv
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+data/borg_traces_data.csv
+data/borg_traces_data.zip
