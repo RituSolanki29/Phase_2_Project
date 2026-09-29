@@ -70,6 +70,18 @@ class TraceLoader:
         """
         Reads CSV trace file, cleans records, applies time compression,
         and constructs WorkloadPod objects.
+
+        NOTE ON REGION ASSIGNMENT (explicit assumption):
+        The 2019 Google/Borg trace release used here does not include the
+        `machine_events` / `machine_attributes` tables, so there is no real
+        geography or hardware-capacity data tied to `machine_id`. Region and
+        node assignment below is therefore a *documented synthetic mapping*,
+        not data derived from the trace: each distinct `machine_id` is hashed
+        deterministically to one of the synthetic regions, so the same
+        machine always lands in the same region across the whole run (unlike
+        a naive `row_index % num_regions`, which would scatter the very same
+        machine across different "regions" depending only on which row it
+        happened to appear on).
         """
         if node_pool_regions is None:
             node_pool_regions = ["DC_EU", "DC_US", "DC_ASIA"]
@@ -109,10 +121,12 @@ class TraceLoader:
             # Apply timeline compression
             compressed_duration = max(5.0, raw_duration / compression_factor)
             
-            # Assign source region and node deterministically based on machine_id / row index
-            region_idx = idx % len(node_pool_regions)
+            # Assign source region deterministically FROM machine_id (not row order),
+            # so the same machine always resolves to the same synthetic region.
+            machine_id_val = int(row.get("machine_id", idx))
+            region_idx = machine_id_val % len(node_pool_regions)
             source_region = node_pool_regions[region_idx]
-            machine_num = (int(row.get("machine_id", idx)) % 3) + 1
+            machine_num = (machine_id_val % 3) + 1
             region_prefix = source_region.split("_")[1].lower()
             source_node = f"{region_prefix}-node-{machine_num}"
             

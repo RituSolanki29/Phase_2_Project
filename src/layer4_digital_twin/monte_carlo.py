@@ -64,8 +64,15 @@ class MonteCarloEngine:
         current_node = frame.current_node
         
         # 1. GBR Execution Time Prediction
+        # The GBR predicts a hardware-agnostic BASELINE duration (see
+        # gbr_predictor.py docstring for why mips_ratio is not a model
+        # feature). We then deterministically project that baseline onto the
+        # target node's MIPS rating using the same formula used everywhere
+        # else in Layer 3/4, so heterogeneity is applied consistently.
         mips_ratio = HardwareHeterogeneityModel.get_execution_scaling_factor(current_node, target_node)
-        predicted_exec_time, exec_std = self.gbr.predict(pod, mips_ratio)
+        baseline_exec_time, baseline_std = self.gbr.predict(pod)
+        predicted_exec_time = round(baseline_exec_time * mips_ratio, 2)
+        exec_std = round(baseline_std * mips_ratio, 2)
         
         # 2. Clark Migration Overhead Model
         migration_est = self.clark.estimate_migration_cost(
