@@ -1,0 +1,55 @@
+{
+  "experiment": {
+    "dataset": "data\\borg_traces_data.csv",
+    "workloads_loaded": 1000,
+    "nodes": 9,
+    "regions": [
+      "DC_ASIA",
+      "DC_EU",
+      "DC_US"
+    ],
+    "mode": "time_sweep",
+    "time_sweep_hours": 24,
+    "monte_carlo_runs": 1000,
+    "random_seed": 42,
+    "candidate_evaluations": 1440
+  },
+  "predictor": {
+    "train_samples": 800.0,
+    "test_samples": 200.0,
+    "mae": 6.327113955228803,
+    "rmse": 8.38278886244871,
+    "r2": 0.3867438787825489,
+    "smape_percent": 38.52202515331304,
+    "baseline_mae": 10.129439999999999,
+    "baseline_rmse": 10.81545079966619,
+    "baseline_r2": -0.020831560480215616,
+    "rmse_improvement_percent": 22.4924691746789,
+    "residual_std": 8.354241205700998
+  },
+  "predictor_feature_importance": {
+    "cpu_request": 0.02400437154153461,
+    "ram_request_gb": 0.0063770623949918025,
+    "assigned_memory_gb": 0.0094421113723834,
+    "memory_ratio": 0.0072582567762184335,
+    "cpi": 0.2759680411001091,
+    "priority": 0.10621903024920804,
+    "cpu_memory_product": 0.06987825232846094,
+    "log_duration_independent_features": 0.5008528742370937
+  },
+  "scheduler": {
+    "mean_nsga2_runtime_sec": 0.5521351208250659,
+    "p95_nsga2_runtime_sec": 0.675086699964595,
+    "total_pipeline_runtime_sec": 24.325966500036884
+  },
+  "sustainability": {
+    "mean_nsg_gco2": 0.001801717361111111,
+    "mean_gross_carbon_saving_gco2": 0.007779768055555556,
+    "mean_migration_carbon_gco2": 0.005978070833333333
+  },
+  "decisions": {
+    "statistically_viable_count": 143,
+    "rejected_count": 1297,
+    "viable_percentage": 9.930555555555555
+  }
+}

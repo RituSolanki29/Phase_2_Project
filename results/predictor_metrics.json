@@ -1,0 +1,25 @@
+{
+  "metrics": {
+    "train_samples": 800.0,
+    "test_samples": 200.0,
+    "mae": 6.327113955228803,
+    "rmse": 8.38278886244871,
+    "r2": 0.3867438787825489,
+    "smape_percent": 38.52202515331304,
+    "baseline_mae": 10.129439999999999,
+    "baseline_rmse": 10.81545079966619,
+    "baseline_r2": -0.020831560480215616,
+    "rmse_improvement_percent": 22.4924691746789,
+    "residual_std": 8.354241205700998
+  },
+  "feature_importance": {
+    "cpu_request": 0.02400437154153461,
+    "ram_request_gb": 0.0063770623949918025,
+    "assigned_memory_gb": 0.0094421113723834,
+    "memory_ratio": 0.0072582567762184335,
+    "cpi": 0.2759680411001091,
+    "priority": 0.10621903024920804,
+    "cpu_memory_product": 0.06987825232846094,
+    "log_duration_independent_features": 0.5008528742370937
+  }
+}

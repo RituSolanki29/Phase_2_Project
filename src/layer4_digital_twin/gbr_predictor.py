@@ -1,120 +1,344 @@
 """
-GradientBoostingRegressor Runtime Predictor (Layer 4)
-Predicts baseline workload execution runtime (on hardware equivalent to the
-node the workload historically ran on) from trace features, using a strict
-time-based train/test split to prevent leakage.
+Gradient Boosting Runtime Predictor (Layer 4)
 
-IMPORTANT DESIGN NOTE (fixed vs. earlier version):
-MIPS/hardware-heterogeneity scaling is intentionally NOT passed into the GBR
-as a feature. A tree ensemble can only learn a relationship from a feature
-that actually varies across training examples; every historical trace row
-only tells us the duration achieved on ONE piece of hardware, so there is no
-ground truth for "how would this same job run at a different MIPS rating"
-to train against. Feeding a MIPS ratio into the model here would appear
-principled but the model could not have learned anything from it if that
-input were held constant during training, and if we synthesize varying
-ratios we'd just be baking our deterministic formula into noisy labels for
-the model to loosely re-learn.
+Predicts workload execution duration from workload characteristics.
 
-The correct separation of concerns is:
-  - GBR predicts the baseline duration from workload characteristics alone.
-  - HardwareHeterogeneityModel.scale_duration() deterministically projects
-    that baseline duration onto the target node's MIPS rating afterwards.
-This keeps a physically-known deterministic relationship deterministic, and
-lets the learned model focus on what it can actually learn from the data.
+Important methodological rule:
+MIPS is NOT used as a learned feature because the historical trace does not
+provide repeated observations of the same workload across different hardware.
+Hardware scaling is therefore applied deterministically after prediction.
+
+The model additionally reports:
+    - MAE
+    - RMSE
+    - R²
+    - sMAPE
+    - baseline MAE
+    - baseline RMSE
+    - baseline R²
+    - improvement over mean baseline
+    - residual standard deviation
 """
 
-from typing import List, Tuple
+from typing import List, Tuple, Dict
+
 import numpy as np
+
 from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.metrics import root_mean_squared_error, r2_score
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+)
 
 from src.layer1_infra.trace_loader import WorkloadPod
 
 
 class GBRRuntimePredictor:
-    """Predicts baseline workload duration and its prediction-error variance."""
+    """Predicts baseline workload duration and prediction uncertainty."""
 
     def __init__(self, random_state: int = 42):
-        self.model = GradientBoostingRegressor(
-            n_estimators=100,
-            learning_rate=0.05,
-            max_depth=4,
-            random_state=random_state
-        )
-        self.is_trained = False
-        self.residual_std = 5.0  # Default fallback residual standard deviation (seconds)
 
-    def _extract_features(self, pods: List[WorkloadPod]) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Constructs feature matrix X and target vector y from pods.
-        Target is the pod's actual historical duration on its own (source)
-        node -- no MIPS ratio is folded in here; see module docstring.
-        """
+        self.random_state = int(random_state)
+
+        self.model = GradientBoostingRegressor(
+            n_estimators=200,
+            learning_rate=0.03,
+            max_depth=2,
+            min_samples_split=5,
+            min_samples_leaf=3,
+            loss="huber",
+            random_state=self.random_state,
+        )
+
+        self.is_trained = False
+
+        self.residual_std = 5.0
+
+        self.metrics: Dict[str, float] = {}
+
+        self.feature_names = [
+            "cpu_request",
+            "ram_request_gb",
+            "assigned_memory_gb",
+            "memory_ratio",
+            "cpi",
+            "priority",
+            "cpu_memory_product",
+            "log_duration_independent_features",
+        ]
+
+    def _extract_features(
+        self,
+        pods: List[WorkloadPod],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+
         X = []
         y = []
+
         for pod in pods:
-            X.append([
-                pod.cpu_request,
-                pod.ram_request_gb,
-                pod.assigned_memory_gb,
-                pod.cpi,
-                float(pod.priority),
-            ])
-            y.append(pod.duration_sec)
 
-        return np.array(X), np.array(y)
+            ram_request = max(float(pod.ram_request_gb), 0.001)
+            assigned_memory = max(
+                float(pod.assigned_memory_gb),
+                0.001,
+            )
 
-    def train_time_split(self, pods: List[WorkloadPod], train_ratio: float = 0.8) -> Tuple[float, float]:
-        """
-        Trains GBR model using time-ordered split (first train_ratio train,
-        remaining test) to avoid data leakage. Returns (RMSE, R2 score).
-        """
+            memory_ratio = assigned_memory / ram_request
+
+            cpu_memory_product = (
+                float(pod.cpu_request) * assigned_memory
+            )
+
+            # This feature is deliberately independent of the target.
+            independent_log_feature = np.log1p(
+                max(float(pod.cpu_request), 0.0)
+                + max(float(pod.ram_request_gb), 0.0)
+                + max(float(pod.assigned_memory_gb), 0.0)
+                + max(float(pod.cpi), 0.0)
+            )
+
+            X.append(
+                [
+                    float(pod.cpu_request),
+                    float(pod.ram_request_gb),
+                    float(pod.assigned_memory_gb),
+                    float(memory_ratio),
+                    float(pod.cpi),
+                    float(pod.priority),
+                    float(cpu_memory_product),
+                    float(independent_log_feature),
+                ]
+            )
+
+            y.append(float(pod.duration_sec))
+
+        return (
+            np.asarray(X, dtype=float),
+            np.asarray(y, dtype=float),
+        )
+
+    @staticmethod
+    def _smape(
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+    ) -> float:
+
+        denominator = (
+            np.abs(y_true) + np.abs(y_pred)
+        )
+
+        valid = denominator > 0
+
+        if not np.any(valid):
+            return 0.0
+
+        value = (
+            2.0
+            * np.abs(
+                y_true[valid] - y_pred[valid]
+            )
+            / denominator[valid]
+        )
+
+        return float(np.mean(value) * 100.0)
+
+    def train_time_split(
+        self,
+        pods: List[WorkloadPod],
+        train_ratio: float = 0.8,
+    ) -> Tuple[float, float]:
+
         if len(pods) < 10:
-            self.is_trained = True
-            return 0.0, 1.0
+            raise ValueError(
+                "At least 10 workload records are required "
+                "for a meaningful train/test split."
+            )
 
-        # Sort pods chronologically by start_time_micro -- critical to avoid leakage
-        sorted_pods = sorted(pods, key=lambda p: p.start_time_micro)
+        sorted_pods = sorted(
+            pods,
+            key=lambda p: p.start_time_micro,
+        )
 
         X, y = self._extract_features(sorted_pods)
 
-        split_idx = int(len(X) * train_ratio)
-        X_train, X_test = X[:split_idx], X[split_idx:]
-        y_train, y_test = y[:split_idx], y[split_idx:]
+        split_idx = int(
+            len(X) * train_ratio
+        )
 
-        self.model.fit(X_train, y_train)
+        if split_idx <= 0 or split_idx >= len(X):
+            raise ValueError(
+                "train_ratio must leave samples in both "
+                "training and testing sets."
+            )
+
+        X_train = X[:split_idx]
+        X_test = X[split_idx:]
+
+        y_train = y[:split_idx]
+        y_test = y[split_idx:]
+
+        self.model.fit(
+            X_train,
+            y_train,
+        )
+
         self.is_trained = True
 
         y_pred = self.model.predict(X_test)
-        rmse = float(root_mean_squared_error(y_test, y_pred))
-        r2 = float(r2_score(y_test, y_pred))
 
-        residuals = y_test - y_pred
-        self.residual_std = max(1.0, float(np.std(residuals)))
+        mae = float(
+            mean_absolute_error(
+                y_test,
+                y_pred,
+            )
+        )
+
+        mse = float(
+            mean_squared_error(
+                y_test,
+                y_pred,
+            )
+        )
+
+        rmse = float(
+            np.sqrt(mse)
+        )
+
+        r2 = float(
+            r2_score(
+                y_test,
+                y_pred,
+            )
+        )
+
+        smape = self._smape(
+            y_test,
+            y_pred,
+        )
+
+        # Mean-duration baseline.
+        baseline_value = float(
+            np.mean(y_train)
+        )
+
+        baseline_pred = np.full(
+            shape=len(y_test),
+            fill_value=baseline_value,
+            dtype=float,
+        )
+
+        baseline_mae = float(
+            mean_absolute_error(
+                y_test,
+                baseline_pred,
+            )
+        )
+
+        baseline_rmse = float(
+            np.sqrt(
+                mean_squared_error(
+                    y_test,
+                    baseline_pred,
+                )
+            )
+        )
+
+        baseline_r2 = float(
+            r2_score(
+                y_test,
+                baseline_pred,
+            )
+        )
+
+        if baseline_rmse > 0:
+            rmse_improvement_pct = (
+                1.0
+                - rmse / baseline_rmse
+            ) * 100.0
+        else:
+            rmse_improvement_pct = 0.0
+
+        residuals = (
+            y_test - y_pred
+        )
+
+        self.residual_std = max(
+            1.0,
+            float(np.std(residuals)),
+        )
+
+        self.metrics = {
+            "train_samples": float(len(X_train)),
+            "test_samples": float(len(X_test)),
+            "mae": mae,
+            "rmse": rmse,
+            "r2": r2,
+            "smape_percent": smape,
+            "baseline_mae": baseline_mae,
+            "baseline_rmse": baseline_rmse,
+            "baseline_r2": baseline_r2,
+            "rmse_improvement_percent": rmse_improvement_pct,
+            "residual_std": self.residual_std,
+        }
 
         return round(rmse, 3), round(r2, 3)
 
-    def predict(self, pod: WorkloadPod) -> Tuple[float, float]:
-        """
-        Predicts baseline expected duration (mean) and uncertainty standard
-        deviation (std) for `pod`, AT THE HARDWARE CLASS IT WAS HISTORICALLY
-        OBSERVED ON. Callers must apply
-        HardwareHeterogeneityModel.scale_duration() themselves to project
-        this baseline onto a different target node's MIPS rating.
-        """
+    def get_metrics(self) -> Dict[str, float]:
+        """Return all predictor evaluation metrics."""
+
+        return dict(self.metrics)
+
+    def get_feature_importance(self) -> Dict[str, float]:
+        """Return GBR feature importance values."""
+
         if not self.is_trained:
-            # Baseline estimate if untrained
-            return round(pod.duration_sec, 2), self.residual_std
+            return {}
 
-        X_single = np.array([[
-            pod.cpu_request,
-            pod.ram_request_gb,
-            pod.assigned_memory_gb,
-            pod.cpi,
-            float(pod.priority),
-        ]])
+        return {
+            name: float(value)
+            for name, value in zip(
+                self.feature_names,
+                self.model.feature_importances_,
+            )
+        }
 
-        predicted_mean = float(self.model.predict(X_single)[0])
-        predicted_mean = max(2.0, predicted_mean)
-        return round(predicted_mean, 2), self.residual_std
+    def predict(
+        self,
+        pod: WorkloadPod,
+    ) -> Tuple[float, float]:
+
+        if not self.is_trained:
+            return (
+                round(
+                    max(2.0, pod.duration_sec),
+                    2,
+                ),
+                self.residual_std,
+            )
+
+        X_single, _ = self._extract_features(
+            [pod]
+        )
+
+        predicted_mean = float(
+            self.model.predict(
+                X_single
+            )[0]
+        )
+
+        predicted_mean = max(
+            2.0,
+            predicted_mean,
+        )
+
+        return (
+            round(
+                predicted_mean,
+                2,
+            ),
+            round(
+                self.residual_std,
+                4,
+            ),
+        )
