@@ -85,6 +85,10 @@ def _deploy_and_build_frame(pod, node_pools, feature_store, telemetry, timestamp
 
 def _run_one_cycle(cycle_workloads, timestamp_sec, window_label, node_pools, feature_store,
                     telemetry, nsga2, mc_engine, deploy_real_pods, deployed_pods, verbose=True):
+    import sys
+    if verbose:
+        print(f"  Processing {len(cycle_workloads)} workloads (NSGA-II pre-filtering & Monte Carlo Digital Twin)...", flush=True)
+
     frames = [
         _deploy_and_build_frame(pod, node_pools, feature_store, telemetry, timestamp_sec, deploy_real_pods, deployed_pods)
         for pod in cycle_workloads
@@ -96,9 +100,14 @@ def _run_one_cycle(cycle_workloads, timestamp_sec, window_label, node_pools, fea
     nsga_runtime = time.perf_counter() - nsga_start
 
     cycle_results: List[CandidateEvaluationResult] = []
+    total_candidates = sum(len(cands) for cands in candidates_by_pod.values())
+    eval_idx = 0
     for frame in frames:
         pod = frame.pod
         for candidate in candidates_by_pod.get(pod.pod_id, []):
+            eval_idx += 1
+            if verbose and (eval_idx % 20 == 0 or eval_idx == total_candidates):
+                print(f"  Digital Twin Monte Carlo progress: {eval_idx}/{total_candidates} candidates evaluated...", flush=True)
             mc_result = mc_engine.run_simulation(frame=frame, target_node=candidate.target_node)
             result = Layer5OutputCalculator.evaluate_candidate(
                 mc_result=mc_result, pod=pod, current_node=frame.current_node,
@@ -108,9 +117,9 @@ def _run_one_cycle(cycle_workloads, timestamp_sec, window_label, node_pools, fea
             cycle_results.append(result)
 
     if verbose:
-        print(f"  Telemetry frames: {len(frames)} ({real_count} real Kepler, {len(frames) - real_count} model-based)")
+        print(f"  Telemetry frames: {len(frames)} ({real_count} real Kepler, {len(frames) - real_count} model-based)", flush=True)
         print(f"  NSGA-II runtime: {nsga_runtime:.4f}s | Candidates evaluated: {len(cycle_results)} "
-              f"| Raw assignment space: {len(node_pools) ** len(frames):,}")
+              f"| Raw assignment space: {len(node_pools) ** len(frames):,}", flush=True)
 
     return cycle_results, nsga_runtime
 

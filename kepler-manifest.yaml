@@ -60,7 +60,7 @@ data:
       procfs: /host/proc
       sysfs: /host/sys
     kube:
-      enabled: true
+      enabled: false
       nodeName: ""
       podInformer:
         mode: kubelet
@@ -117,8 +117,6 @@ spec:
         - /usr/bin/kepler
         args:
         - --config.file=/etc/kepler/config.yaml
-        - --kube.enable
-        - --kube.node-name=$(NODE_NAME)
         env:
         - name: NODE_NAME
           valueFrom:

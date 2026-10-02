@@ -38,9 +38,9 @@
     "log_duration_independent_features": 0.4779038527575968
   },
   "scheduler": {
-    "mean_nsga2_runtime_sec": 0.5627638999994815,
-    "p95_nsga2_runtime_sec": 0.6007150999994337,
-    "total_pipeline_runtime_sec": 256.30680759999996
+    "mean_nsga2_runtime_sec": 0.5904533499997342,
+    "p95_nsga2_runtime_sec": 0.624014214998897,
+    "total_pipeline_runtime_sec": 8.897176500000569
   },
   "sustainability": {
     "mean_nsg_gco2": 0.002931758333333333,
