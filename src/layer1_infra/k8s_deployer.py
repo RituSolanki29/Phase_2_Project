@@ -71,13 +71,22 @@ def _k8s_pod_name(pod: WorkloadPod) -> str:
     return pod.pod_id.lower().replace("_", "-")[:63]
 
 
-def build_pod_spec(pod: WorkloadPod, node: NodeConfig, namespace: str = DEFAULT_NAMESPACE) -> "client.V1Pod":
+def build_pod_spec(pod: WorkloadPod, node: NodeConfig, namespace: str = DEFAULT_NAMESPACE,
+                    scheduler_name: str = None) -> "client.V1Pod":
     """
     Builds a REAL Pod spec that actually consumes CPU/RAM proportional to
-    the trace-derived request, for approximately `pod.duration_sec` seconds,
-    scheduled onto a node in the target synthetic region via nodeSelector
-    (matching the `topology.kubernetes.io/region` label applied by
-    generate_kind_config()'s kubeadm node-labels patch).
+    the trace-derived request, for approximately `pod.duration_sec` seconds.
+
+    Two submission modes:
+      - scheduler_name=None (default): scheduled immediately by the default
+        Kubernetes scheduler via nodeSelector on `node.region` -- used for
+        direct telemetry-measurement deployments (pipeline_runner.py).
+      - scheduler_name="sustainability-scheduler": submitted UNSCHEDULED
+        (no nodeSelector, no nodeName) with that schedulerName, so the
+        default scheduler ignores it and our custom_scheduler.py picks it
+        up and binds it explicitly after running it through Layers 2-6.
+        Workload parameters are encoded as annotations so the scheduler can
+        reconstruct a WorkloadPod purely from the live cluster object.
     """
     cpu_cores = max(1, math.ceil(pod.cpu_request))
     timeout_sec = max(1, int(pod.duration_sec))
@@ -93,11 +102,26 @@ def build_pod_spec(pod: WorkloadPod, node: NodeConfig, namespace: str = DEFAULT_
         ),
     )
 
-    spec = client.V1PodSpec(
-        containers=[container],
-        node_selector={"topology.kubernetes.io/region": node.region},
-        restart_policy="Never",
-    )
+    spec_kwargs = dict(containers=[container], restart_policy="Never")
+    if scheduler_name:
+        spec_kwargs["scheduler_name"] = scheduler_name
+        # Deliberately NO node_selector: this pod is meant to stay Pending
+        # until custom_scheduler.py evaluates it and binds it explicitly.
+    else:
+        spec_kwargs["node_selector"] = {"topology.kubernetes.io/region": node.region}
+    spec = client.V1PodSpec(**spec_kwargs)
+
+    annotations = {
+        "sustainability.orchestrator/cpu-request": str(pod.cpu_request),
+        "sustainability.orchestrator/ram-request-gb": str(pod.ram_request_gb),
+        "sustainability.orchestrator/assigned-memory-gb": str(pod.assigned_memory_gb),
+        "sustainability.orchestrator/cpi": str(pod.cpi),
+        "sustainability.orchestrator/duration-sec": str(pod.duration_sec),
+        "sustainability.orchestrator/sla-deadline-sec": str(pod.sla_deadline_sec),
+        "sustainability.orchestrator/priority": str(pod.priority),
+        "sustainability.orchestrator/source-node": pod.source_node,
+        "sustainability.orchestrator/source-region": pod.source_region,
+    } if scheduler_name else {}
 
     metadata = client.V1ObjectMeta(
         name=_k8s_pod_name(pod),
@@ -107,16 +131,20 @@ def build_pod_spec(pod: WorkloadPod, node: NodeConfig, namespace: str = DEFAULT_
             "pod-id": pod.pod_id,
             "region": node.region,
         },
+        annotations=annotations,
     )
 
     return client.V1Pod(metadata=metadata, spec=spec)
 
 
-def deploy_pod(pod: WorkloadPod, node: NodeConfig, namespace: str = DEFAULT_NAMESPACE) -> str:
-    """Creates the real Pod on the cluster. Returns the K8s pod name."""
+def deploy_pod(pod: WorkloadPod, node: NodeConfig, namespace: str = DEFAULT_NAMESPACE,
+               scheduler_name: str = None) -> str:
+    """Creates the real Pod on the cluster. Returns the K8s pod name.
+    Pass scheduler_name to submit it unscheduled for custom_scheduler.py to
+    pick up and bind (see build_pod_spec)."""
     ensure_namespace(namespace)
     v1 = client.CoreV1Api()
-    pod_spec = build_pod_spec(pod, node, namespace)
+    pod_spec = build_pod_spec(pod, node, namespace, scheduler_name=scheduler_name)
     k8s_name = _k8s_pod_name(pod)
     try:
         v1.create_namespaced_pod(namespace=namespace, body=pod_spec)
@@ -126,6 +154,28 @@ def deploy_pod(pod: WorkloadPod, node: NodeConfig, namespace: str = DEFAULT_NAME
         else:
             raise
     return k8s_name
+
+
+def workload_pod_from_annotations(k8s_pod) -> "WorkloadPod":
+    """Reconstructs a WorkloadPod from a live Kubernetes pod object's
+    annotations (see build_pod_spec) -- used by custom_scheduler.py so it
+    can evaluate a real pending pod without needing the original Python
+    WorkloadPod instance that submitted it."""
+    a = k8s_pod.metadata.annotations or {}
+    return WorkloadPod(
+        pod_id=k8s_pod.metadata.labels.get("pod-id", k8s_pod.metadata.name),
+        collection_id=0, instance_index=0, user="demo",
+        priority=int(a.get("sustainability.orchestrator/priority", 0)),
+        cpu_request=float(a.get("sustainability.orchestrator/cpu-request", 1.0)),
+        ram_request_gb=float(a.get("sustainability.orchestrator/ram-request-gb", 2.0)),
+        assigned_memory_gb=float(a.get("sustainability.orchestrator/assigned-memory-gb", 2.0)),
+        cpi=float(a.get("sustainability.orchestrator/cpi", 1.2)),
+        duration_sec=float(a.get("sustainability.orchestrator/duration-sec", 30.0)),
+        start_time_micro=0, end_time_micro=0,
+        source_node=a.get("sustainability.orchestrator/source-node", "eu-node-1"),
+        source_region=a.get("sustainability.orchestrator/source-region", "DC_EU"),
+        sla_deadline_sec=float(a.get("sustainability.orchestrator/sla-deadline-sec", 45.0)),
+    )
 
 
 def wait_for_pod_running(k8s_pod_name: str, namespace: str = DEFAULT_NAMESPACE, timeout_sec: float = 30.0) -> bool:
@@ -170,6 +220,36 @@ def get_pod_resource_usage(k8s_pod_name: str, namespace: str = DEFAULT_NAMESPACE
         return cpu_cores, mem_gb
     except Exception:
         return None
+
+
+def bind_pod_to_node(pod_name: str, node_name: str, namespace: str = DEFAULT_NAMESPACE) -> None:
+    """
+    Binds an UNSCHEDULED pod (spec.nodeName empty, status.phase Pending) to
+    a specific node via the real Kubernetes Binding subresource -- this is
+    the same mechanism kube-scheduler itself uses, which is why building a
+    custom scheduler this way is a real, idiomatic pattern rather than a
+    workaround: https://kubernetes.io/docs/reference/generated/kubernetes-api/
+    (see Binding). No pod recreation is needed; the API server attaches the
+    pod to the node directly.
+    """
+    v1 = client.CoreV1Api()
+    binding = client.V1Binding(
+        metadata=client.V1ObjectMeta(name=pod_name),
+        target=client.V1ObjectReference(kind="Node", api_version="v1", name=node_name),
+    )
+    v1.create_namespaced_binding(name=pod_name, namespace=namespace, body=binding, _preload_content=False)
+
+
+def list_pending_unscheduled_pods(scheduler_name: str, namespace: str = DEFAULT_NAMESPACE):
+    """Returns pods with spec.schedulerName == scheduler_name that are still
+    Pending and unbound (no nodeName yet) -- the real queue a custom
+    scheduler watches and binds from."""
+    v1 = client.CoreV1Api()
+    pods = v1.list_namespaced_pod(namespace=namespace).items
+    return [
+        p for p in pods
+        if p.spec.scheduler_name == scheduler_name and p.status.phase == "Pending" and not p.spec.node_name
+    ]
 
 
 def delete_pod(k8s_pod_name: str, namespace: str = DEFAULT_NAMESPACE) -> None:

@@ -16,12 +16,10 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
-
 def _save(fig, path):
     fig.tight_layout()
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-
 
 def plot_carbon_intensity_curve(carbon_feed, regions, output_dir: Path, hours: int = 24):
     """24-hour carbon-intensity curve per region, from the same model the
