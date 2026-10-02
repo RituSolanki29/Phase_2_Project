@@ -1,55 +1,55 @@
 {
   "experiment": {
     "dataset": "data\\borg_traces_data.csv",
-    "workloads_loaded": 1000,
+    "workloads_loaded": 200,
     "nodes": 9,
     "regions": [
       "DC_ASIA",
       "DC_EU",
       "DC_US"
     ],
-    "mode": "time_sweep",
-    "time_sweep_hours": 24,
+    "mode": "paired_two_window",
+    "time_sweep_hours": 0,
     "monte_carlo_runs": 1000,
     "random_seed": 42,
-    "candidate_evaluations": 1440
+    "candidate_evaluations": 120
   },
   "predictor": {
-    "train_samples": 800.0,
-    "test_samples": 200.0,
-    "mae": 6.327113955228803,
-    "rmse": 8.38278886244871,
-    "r2": 0.3867438787825489,
-    "smape_percent": 38.52202515331304,
-    "baseline_mae": 10.129439999999999,
-    "baseline_rmse": 10.81545079966619,
-    "baseline_r2": -0.020831560480215616,
-    "rmse_improvement_percent": 22.4924691746789,
-    "residual_std": 8.354241205700998
+    "train_samples": 160.0,
+    "test_samples": 40.0,
+    "mae": 4.851037756096527,
+    "rmse": 7.243652549949731,
+    "r2": 0.5001366547819117,
+    "smape_percent": 29.29771281279817,
+    "baseline_mae": 9.92434375,
+    "baseline_rmse": 10.551580616932467,
+    "baseline_r2": -0.060647597779859064,
+    "rmse_improvement_percent": 31.350071492363863,
+    "residual_std": 7.140327613522398
   },
   "predictor_feature_importance": {
-    "cpu_request": 0.02400437154153461,
-    "ram_request_gb": 0.0063770623949918025,
-    "assigned_memory_gb": 0.0094421113723834,
-    "memory_ratio": 0.0072582567762184335,
-    "cpi": 0.2759680411001091,
-    "priority": 0.10621903024920804,
-    "cpu_memory_product": 0.06987825232846094,
-    "log_duration_independent_features": 0.5008528742370937
+    "cpu_request": 0.026150794342762983,
+    "ram_request_gb": 0.035570686872854584,
+    "assigned_memory_gb": 0.034051964827008036,
+    "memory_ratio": 0.027140923798340783,
+    "cpi": 0.313747976067103,
+    "priority": 0.020397175192041192,
+    "cpu_memory_product": 0.06503662614229266,
+    "log_duration_independent_features": 0.4779038527575968
   },
   "scheduler": {
-    "mean_nsga2_runtime_sec": 0.5521351208250659,
-    "p95_nsga2_runtime_sec": 0.675086699964595,
-    "total_pipeline_runtime_sec": 24.325966500036884
+    "mean_nsga2_runtime_sec": 0.5627638999994815,
+    "p95_nsga2_runtime_sec": 0.6007150999994337,
+    "total_pipeline_runtime_sec": 256.30680759999996
   },
   "sustainability": {
-    "mean_nsg_gco2": 0.001801717361111111,
-    "mean_gross_carbon_saving_gco2": 0.007779768055555556,
-    "mean_migration_carbon_gco2": 0.005978070833333333
+    "mean_nsg_gco2": 0.002931758333333333,
+    "mean_gross_carbon_saving_gco2": 0.009566825,
+    "mean_migration_carbon_gco2": 0.006635025
   },
   "decisions": {
-    "statistically_viable_count": 143,
-    "rejected_count": 1297,
-    "viable_percentage": 9.930555555555555
+    "statistically_viable_count": 27,
+    "rejected_count": 93,
+    "viable_percentage": 22.5
   }
 }

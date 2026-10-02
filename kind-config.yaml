@@ -1,0 +1,40 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+- role: worker
+  kubeadmConfigPatches:
+  - "kind: JoinConfiguration\nnodeRegistration:\n  kubeletExtraArgs:\n    node-labels:\
+    \ \"topology.kubernetes.io/region=DC_EU,mips=4000.0,node-id=eu-node-1\""
+- role: worker
+  kubeadmConfigPatches:
+  - "kind: JoinConfiguration\nnodeRegistration:\n  kubeletExtraArgs:\n    node-labels:\
+    \ \"topology.kubernetes.io/region=DC_EU,mips=4000.0,node-id=eu-node-2\""
+- role: worker
+  kubeadmConfigPatches:
+  - "kind: JoinConfiguration\nnodeRegistration:\n  kubeletExtraArgs:\n    node-labels:\
+    \ \"topology.kubernetes.io/region=DC_EU,mips=4000.0,node-id=eu-node-3\""
+- role: worker
+  kubeadmConfigPatches:
+  - "kind: JoinConfiguration\nnodeRegistration:\n  kubeletExtraArgs:\n    node-labels:\
+    \ \"topology.kubernetes.io/region=DC_US,mips=3500.0,node-id=us-node-1\""
+- role: worker
+  kubeadmConfigPatches:
+  - "kind: JoinConfiguration\nnodeRegistration:\n  kubeletExtraArgs:\n    node-labels:\
+    \ \"topology.kubernetes.io/region=DC_US,mips=3500.0,node-id=us-node-2\""
+- role: worker
+  kubeadmConfigPatches:
+  - "kind: JoinConfiguration\nnodeRegistration:\n  kubeletExtraArgs:\n    node-labels:\
+    \ \"topology.kubernetes.io/region=DC_US,mips=3500.0,node-id=us-node-3\""
+- role: worker
+  kubeadmConfigPatches:
+  - "kind: JoinConfiguration\nnodeRegistration:\n  kubeletExtraArgs:\n    node-labels:\
+    \ \"topology.kubernetes.io/region=DC_ASIA,mips=2800.0,node-id=asia-node-1\""
+- role: worker
+  kubeadmConfigPatches:
+  - "kind: JoinConfiguration\nnodeRegistration:\n  kubeletExtraArgs:\n    node-labels:\
+    \ \"topology.kubernetes.io/region=DC_ASIA,mips=2800.0,node-id=asia-node-2\""
+- role: worker
+  kubeadmConfigPatches:
+  - "kind: JoinConfiguration\nnodeRegistration:\n  kubeletExtraArgs:\n    node-labels:\
+    \ \"topology.kubernetes.io/region=DC_ASIA,mips=2800.0,node-id=asia-node-3\""
