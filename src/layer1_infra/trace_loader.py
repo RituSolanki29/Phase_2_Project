@@ -86,7 +86,24 @@ class TraceLoader:
         if node_pool_regions is None:
             node_pool_regions = ["DC_EU", "DC_US", "DC_ASIA"]
 
-        df = pd.read_csv(self.csv_path, nrows=limit)
+        df = pd.read_csv(self.csv_path)
+
+    # Keep one record per unique workload instance
+        if "collection_id" in df.columns and "instance_index" in df.columns:
+            df = df.drop_duplicates(
+                subset=["collection_id", "instance_index"],
+                keep="first"
+            )
+
+        # Select workloads distributed across the complete trace
+        if len(df) > limit:
+            indices = [
+                int(i)
+                for i in __import__("numpy").linspace(0, len(df) - 1, limit)
+            ]
+            df = df.iloc[indices].reset_index(drop=True)
+        else:
+            df = df.reset_index(drop=True)
         pods: List[WorkloadPod] = []
         
         for idx, row in df.iterrows():
@@ -129,8 +146,8 @@ class TraceLoader:
             machine_num = (machine_id_val % 3) + 1
             region_prefix = source_region.split("_")[1].lower()
             source_node = f"{region_prefix}-node-{machine_num}"
-            
-            pod_id = f"pod-{row.get('collection_id', idx)}-{row.get('instance_index', 0)}"
+
+            pod_id = f"pod-{int(float(row.get('collection_id', idx)))}-{int(float(row.get('instance_index', 0)))}"
             sla_deadline = compressed_duration * 1.5
 
             pod = WorkloadPod(

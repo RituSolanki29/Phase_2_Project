@@ -143,9 +143,13 @@ class TelemetrySource:
         Estimates power draw for a CANDIDATE node the pod is not currently
         running on. Always uses the deterministic physics-formula model --
         this is intentional, see module docstring: there is no real
-        measurement of a hypothetical placement.
+        measurement of a hypothetical placement. Automatically incorporates
+        calibration parameters if fitted from real cluster data.
         """
-        return self._sim_kepler.estimate_pod_power(cpu_util, ram_used_gb, node_idle_power_w, node_max_power_w, node_cpu_cores)
+        from src.layer2_telemetry.calibration import load_calibration_params
+        scale, offset = load_calibration_params()
+        raw_power = self._sim_kepler.estimate_pod_power(cpu_util, ram_used_gb, node_idle_power_w, node_max_power_w, node_cpu_cores)
+        return max(0.0, raw_power * scale + offset)
 
     def get_region_forecast(self, region: str, start_time: float, horizon_sec: float, step_sec: float = 60.0):
         """

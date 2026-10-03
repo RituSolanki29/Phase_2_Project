@@ -37,6 +37,7 @@ from src.layer8_feedback.reward_store import RewardStore
 
 SCHEDULER_NAME = "sustainability-scheduler"
 POLL_INTERVAL_SEC = 5.0
+MAX_DELAY_CYCLES = 3
 
 
 class CustomScheduler:
@@ -51,7 +52,7 @@ class CustomScheduler:
         self.gbr = GBRRuntimePredictor(random_state=seed)
         self.gbr.train_time_split(pods, train_ratio=0.8)
 
-        self.nsga2 = NSGA2PreFilter(self.telemetry, top_k=2, pop_size=40, n_gen=25, seed=seed)
+        self.nsga2 = NSGA2PreFilter(self.telemetry, top_k=3, pop_size=40, n_gen=25, seed=seed)
         self.clark = ClarkMigrationModel()
         self.simpy_sampler = SimPyCarbonSampler(self.telemetry._sim_carbon)
         self.mc_engine = MonteCarloEngine(self.gbr, self.clark, self.simpy_sampler, self.telemetry,
@@ -69,13 +70,15 @@ class CustomScheduler:
         self.gate = DecisionGate(self.ppo_agent)
         self.cooldown = CooldownManager()
         self.reward_store = RewardStore()
+        self._delay_counts = {}
 
     def _evaluate_and_bind(self, k8s_pod) -> None:
         pod = k8s_deployer.workload_pod_from_annotations(k8s_pod)
         current_node = next((n for n in self.node_pools if n.node_id == pod.source_node), self.node_pools[0])
 
-        frame = self.feature_store.build_telemetry_frame(pod, self.node_pools, timestamp_sec=time.time() % 86400)
-        candidates = self.nsga2.filter_and_rank(frame)
+        timestamp_sec = time.time() % 86400
+        frame = self.feature_store.build_telemetry_frame(pod, self.node_pools, timestamp_sec=timestamp_sec)
+        candidates = self.nsga2.quick_rank_single(frame)
         if not candidates:
             print(f"[CustomScheduler] No feasible candidates for {pod.pod_id}; skipping this cycle.")
             return
@@ -85,25 +88,62 @@ class CustomScheduler:
             mc_result = self.mc_engine.run_simulation(frame, cand.target_node)
             layer5_results.append(Layer5OutputCalculator.evaluate_candidate(
                 mc_result, pod, frame.current_node, cand.target_node,
+                timestamp_sec=timestamp_sec,
             ))
 
         decision = self.gate.decide_best_candidate(layer5_results)
-        chosen_result = next((r for r in layer5_results if r.target_node_id == decision.target_node_id), layer5_results[0])
+
+        # A pod that keeps getting DELAYed must not stay Pending forever:
+        # after MAX_DELAY_CYCLES, force-bind the lowest-SLA-risk candidate.
+        if decision.action == "DELAY":
+            n = self._delay_counts.get(pod.pod_id, 0) + 1
+            self._delay_counts[pod.pod_id] = n
+            if n >= MAX_DELAY_CYCLES:
+                best = min(layer5_results, key=lambda r: r.sla_risk_score)
+                decision.action = "START"
+                decision.target_node_id = best.target_node_id
+                decision.rationale += f" Forced start after {n} delayed cycles (lowest SLA risk candidate)."
+
+        chosen_result = next((r for r in layer5_results if r.target_node_id == decision.target_node_id),
+                             layer5_results[0])
         target_node = next(n for n in self.node_pools if n.node_id == decision.target_node_id)
 
-        print(f"[CustomScheduler] {pod.pod_id}: {decision.rationale}")
+        print(f"[CustomScheduler] {pod.pod_id}: {decision.action} -> {target_node.node_id}. {decision.rationale}")
 
-        if decision.action in ("MIGRATE", "START") and not self.cooldown.is_in_cooldown(target_node.node_id):
+        action = decision.action
+        # Cooldown only guards MIGRATIONS (thrash prevention). If the target is
+        # cooling down, start the pod in place instead of skipping it.
+        if action == "MIGRATE" and self.cooldown.is_in_cooldown(target_node.node_id):
+            print(f"[CustomScheduler]   -> {target_node.node_id} in cooldown; starting in place on {current_node.node_id}.")
+            action = "START"
+            target_node = current_node
+            chosen_result = next((r for r in layer5_results if r.target_node_id == current_node.node_id),
+                                 chosen_result)
+
+        if action in ("MIGRATE", "START"):
             try:
                 k8s_deployer.bind_pod_to_node(k8s_pod.metadata.name, target_node.node_id, k8s_deployer.DEFAULT_NAMESPACE)
-                self.cooldown.start_cooldown(target_node.node_id)
+                if action == "MIGRATE":
+                    self.cooldown.start_cooldown(target_node.node_id)
                 print(f"[CustomScheduler]   -> Bound {k8s_pod.metadata.name} to node {target_node.node_id}.")
-                self.reward_store.record_decision(pod.pod_id, decision.action, chosen_result, target_node.node_id)
+                self._delay_counts.pop(pod.pod_id, None)
+                # Only log a decision once the bind actually succeeded.
+                self.reward_store.record_decision(
+                    pod.pod_id, action, chosen_result, target_node.node_id,
+                    context={
+                        "cpu_request": pod.cpu_request,
+                        "ram_request_gb": pod.ram_request_gb,
+                        "assigned_memory_gb": pod.assigned_memory_gb,
+                        "duration_sec": pod.duration_sec,
+                        "timestamp_sec": timestamp_sec,
+                        "nominal_node_id": current_node.node_id,
+                    },
+                )
             except Exception as exc:
-                print(f"[CustomScheduler]   -> Bind failed: {exc}")
+                print(f"[CustomScheduler]   -> Bind API reported: {exc}")
         else:
-            print(f"[CustomScheduler]   -> {decision.action}: not binding this cycle "
-                  f"(cooldown or hard-gate/DELAY).")
+            print(f"[CustomScheduler]   -> {action}: not binding this cycle "
+                  f"(delay {self._delay_counts.get(pod.pod_id, 0)}/{MAX_DELAY_CYCLES}).")
 
     def run_forever(self) -> None:
         print(f"[CustomScheduler] Watching for Pending pods with schedulerName='{SCHEDULER_NAME}'...")

@@ -132,6 +132,75 @@ def plot_hourly_sweep(hourly_df: pd.DataFrame, output_dir: Path):
     _save(fig, output_dir / "hourly_sweep.png")
 
 
+def plot_rl_learning_curve(reward_log_path: Path, output_dir: Path):
+    """Visualizes cumulative net carbon savings and RL policy adaptation over decisions."""
+    reward_log_path = Path(reward_log_path)
+    if not reward_log_path.exists():
+        return
+    import json
+    decisions = []
+    with open(reward_log_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                try:
+                    entry = json.loads(line)
+                    if entry.get("event") == "decision":
+                        cand = entry.get("candidate", {})
+                        decisions.append({
+                            "pod_id": entry.get("pod_id"),
+                            "action": entry.get("action"),
+                            "bound_node_id": entry.get("bound_node_id"),
+                            "nsg_mean_gco2": float(cand.get("nsg_mean_gco2", 0.0)),
+                            "timestamp": entry.get("timestamp", 0.0),
+                        })
+                except Exception:
+                    pass
+
+    if len(decisions) < 2:
+        return
+
+    df = pd.DataFrame(decisions)
+    df["cumulative_nsg"] = df["nsg_mean_gco2"].cumsum()
+    df["decision_idx"] = np.arange(1, len(df) + 1)
+
+    fig, ax1 = plt.subplots(figsize=(9, 5))
+    ax1.plot(df["decision_idx"], df["cumulative_nsg"], color="#1f77b4", linewidth=2.5, marker="o", markersize=4, label="Cumulative NSG (gCO2)")
+    ax1.set_xlabel("Decision Number (Evaluated Workloads)")
+    ax1.set_ylabel("Cumulative Carbon Saved (gCO2)", color="#1f77b4")
+    ax1.tick_params(axis="y", labelcolor="#1f77b4")
+    ax1.grid(alpha=0.3)
+
+    # Rolling average NSG per decision
+    window = max(2, min(5, len(df) // 3))
+    df["rolling_nsg"] = df["nsg_mean_gco2"].rolling(window=window, min_periods=1).mean()
+    ax2 = ax1.twinx()
+    ax2.plot(df["decision_idx"], df["rolling_nsg"], color="#2ca02c", linestyle="--", linewidth=1.8, label=f"Rolling Mean NSG (win={window})")
+    ax2.set_ylabel("Rolling Mean NSG per Decision (gCO2)", color="#2ca02c")
+    ax2.tick_params(axis="y", labelcolor="#2ca02c")
+
+    ax1.set_title("Agent Learning & Cumulative Sustainability Benefit")
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left")
+    _save(fig, output_dir / "rl_learning_curve.png")
+
+
+def plot_regional_routing_distribution(results_df: pd.DataFrame, output_dir: Path):
+    """Bar chart illustrating workload migration flux from high-carbon source regions to low-carbon targets."""
+    if "current_region" not in results_df.columns or "target_region" not in results_df.columns:
+        return
+    crosstab = pd.crosstab(results_df["current_region"], results_df["target_region"])
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    crosstab.plot(kind="bar", stacked=True, ax=ax, colormap="viridis", edgecolor="black", alpha=0.85)
+    ax.set_xlabel("Source Workload Nominal Region")
+    ax.set_ylabel("Assigned Workload Count")
+    ax.set_title("Dynamic Regional Routing Flux by Sustainability Orchestrator")
+    ax.legend(title="Target Region", bbox_to_anchor=(1.02, 1), loc="upper left")
+    ax.grid(alpha=0.3, axis="y")
+    plt.xticks(rotation=0)
+    _save(fig, output_dir / "regional_routing_flux.png")
+
+
 def generate_all_visualizations(
     results_df: pd.DataFrame,
     pods,
@@ -141,6 +210,7 @@ def generate_all_visualizations(
     regions,
     output_dir: Path,
     hourly_df: pd.DataFrame = None,
+    reward_log_path: Path = None,
 ):
     """Generates every chart this module knows how to make from one run's
     outputs. Never raises: a plotting failure should not fail the pipeline."""
@@ -153,9 +223,12 @@ def generate_all_visualizations(
         ("decision_space.png", lambda: plot_decision_space(results_df, plots_dir)),
         ("predictor_quality.png", lambda: plot_predictor_quality(pods, predictor, plots_dir)),
         ("feature_importance.png", lambda: plot_feature_importance(feature_importance, plots_dir)),
+        ("regional_routing_flux.png", lambda: plot_regional_routing_distribution(results_df, plots_dir)),
     ]
     if hourly_df is not None and not hourly_df.empty:
         steps.append(("hourly_sweep.png", lambda: plot_hourly_sweep(hourly_df, plots_dir)))
+    if reward_log_path is not None and Path(reward_log_path).exists():
+        steps.append(("rl_learning_curve.png", lambda: plot_rl_learning_curve(reward_log_path, plots_dir)))
 
     for name, fn in steps:
         try:

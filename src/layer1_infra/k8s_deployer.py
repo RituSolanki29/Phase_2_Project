@@ -55,12 +55,18 @@ def is_cluster_reachable(kubeconfig_path: Optional[str] = None, timeout_sec: flo
 
 def ensure_namespace(namespace: str = DEFAULT_NAMESPACE) -> None:
     """Creates the working namespace if it doesn't already exist."""
+    config.load_kube_config()
     v1 = client.CoreV1Api()
+
     try:
         v1.read_namespace(name=namespace)
     except ApiException as e:
         if e.status == 404:
-            v1.create_namespace(client.V1Namespace(metadata=client.V1ObjectMeta(name=namespace)))
+            v1.create_namespace(
+                client.V1Namespace(
+                    metadata=client.V1ObjectMeta(name=namespace)
+                )
+            )
         else:
             raise
 
@@ -91,14 +97,21 @@ def build_pod_spec(pod: WorkloadPod, node: NodeConfig, namespace: str = DEFAULT_
     cpu_cores = max(1, math.ceil(pod.cpu_request))
     timeout_sec = max(1, int(pod.duration_sec))
 
+    memory_mb = 64
+
     container = client.V1Container(
         name="workload",
-        image=STRESS_IMAGE,
-        args=["--cpu", str(cpu_cores), "--vm", "1", "--vm-bytes",
-              f"{max(16, int(pod.ram_request_gb * 1024))}M", "--timeout", f"{timeout_sec}s"],
+        image="busybox:latest",
+        command=["sh", "-c", f"sleep {timeout_sec}"],
         resources=client.V1ResourceRequirements(
-            requests={"cpu": f"{pod.cpu_request:.2f}", "memory": f"{int(pod.ram_request_gb * 1024)}Mi"},
-            limits={"cpu": f"{pod.cpu_request:.2f}", "memory": f"{int(pod.ram_request_gb * 1024)}Mi"},
+            requests={
+                "cpu": f"{pod.cpu_request:.2f}",
+                "memory": "256Mi"
+            },
+            limits={
+                "cpu": f"{pod.cpu_request:.2f}",
+                "memory": "512Mi"
+            },
         ),
     )
 
@@ -149,8 +162,13 @@ def deploy_pod(pod: WorkloadPod, node: NodeConfig, namespace: str = DEFAULT_NAME
     try:
         v1.create_namespaced_pod(namespace=namespace, body=pod_spec)
     except ApiException as e:
-        if e.status == 409:  # already exists (e.g. re-run) -- reuse it
-            pass
+        if e.status == 409:  # already exists from previous run -- recreate cleanly
+            try:
+                v1.delete_namespaced_pod(name=k8s_name, namespace=namespace, grace_period_seconds=0)
+                time.sleep(0.5)
+            except Exception:
+                pass
+            v1.create_namespaced_pod(namespace=namespace, body=pod_spec)
         else:
             raise
     return k8s_name
@@ -222,22 +240,147 @@ def get_pod_resource_usage(k8s_pod_name: str, namespace: str = DEFAULT_NAMESPACE
         return None
 
 
-def bind_pod_to_node(pod_name: str, node_name: str, namespace: str = DEFAULT_NAMESPACE) -> None:
+def bind_pod_to_node(
+    pod_name: str,
+    node_name: str,
+    namespace: str = DEFAULT_NAMESPACE,
+    verify_timeout_sec: float = 5.0,
+):
     """
-    Binds an UNSCHEDULED pod (spec.nodeName empty, status.phase Pending) to
-    a specific node via the real Kubernetes Binding subresource -- this is
-    the same mechanism kube-scheduler itself uses, which is why building a
-    custom scheduler this way is a real, idiomatic pattern rather than a
-    workaround: https://kubernetes.io/docs/reference/generated/kubernetes-api/
-    (see Binding). No pod recreation is needed; the API server attaches the
-    pod to the node directly.
+    Bind a Pending pod to a Kubernetes node.
+
+    ``node_name`` may be either the real Kubernetes node name or the
+    project's logical ``node-id`` label.
+
+    Important compatibility detail:
+    recent versions of the Kubernetes Python client can successfully submit
+    a Binding but then fail while deserializing the HTTP response into
+    ``V1Binding``. That produces the misleading:
+
+        ValueError: Invalid value for `target`, must not be `None`
+
+    The Binding API does not need the response body, so we deliberately use
+    ``_preload_content=False`` and then verify the pod's ``spec.node_name``.
+    We also use the pod-specific Binding endpoint when available.
     """
+    if not _K8S_CLIENT_AVAILABLE:
+        raise RuntimeError(
+            "The Kubernetes Python client is not installed. "
+            "Install the dependencies from requirements.txt."
+        )
+
     v1 = client.CoreV1Api()
-    binding = client.V1Binding(
-        metadata=client.V1ObjectMeta(name=pod_name),
-        target=client.V1ObjectReference(kind="Node", api_version="v1", name=node_name),
+
+    # Resolve the project's logical node-id to the real Kubernetes node name.
+    actual_node_name = None
+    for node in v1.list_node().items:
+        k8s_name = node.metadata.name
+        if k8s_name == node_name:
+            actual_node_name = k8s_name
+            break
+
+        labels = node.metadata.labels or {}
+        if labels.get("node-id") == node_name:
+            actual_node_name = k8s_name
+            break
+
+    if actual_node_name is None:
+        raise ValueError(
+            f"Could not find Kubernetes node for logical node '{node_name}'"
+        )
+
+    # Fail early with a useful error if the scheduler is trying to bind a
+    # pod that disappeared or is already assigned.
+    pod = v1.read_namespaced_pod(name=pod_name, namespace=namespace)
+    existing_node = getattr(pod.spec, "node_name", None)
+    if existing_node:
+        if existing_node == actual_node_name:
+            # Idempotent success: another scheduler cycle may already have
+            # completed this bind.
+            return
+        raise RuntimeError(
+            f"Pod '{pod_name}' is already assigned to Kubernetes node "
+            f"'{existing_node}', cannot re-bind it to '{actual_node_name}'."
+        )
+
+    target = client.V1ObjectReference(
+        api_version="v1",
+        kind="Node",
+        name=actual_node_name,
     )
-    v1.create_namespaced_binding(name=pod_name, namespace=namespace, body=binding, _preload_content=False)
+
+    metadata = client.V1ObjectMeta(name=pod_name)
+
+    # Explicitly supply target. It is required by the Kubernetes Binding API.
+    body = client.V1Binding(
+        api_version="v1",
+        kind="Binding",
+        metadata=metadata,
+        target=target,
+    )
+
+    # The pod-specific endpoint is the canonical endpoint for binding a pod.
+    # _preload_content=False is intentional: it prevents the Python client
+    # from trying to deserialize the Binding response and triggering the
+    # misleading V1Binding.target == None validation error.
+    try:
+        response = v1.create_namespaced_pod_binding(
+            name=pod_name,
+            namespace=namespace,
+            body=body,
+            _preload_content=False,
+        )
+    except AttributeError:
+        # Compatibility fallback for older clients that do not expose the
+        # pod-specific convenience method.
+        response = v1.create_namespaced_binding(
+            namespace=namespace,
+            body=body,
+            _preload_content=False,
+        )
+
+    status_code = getattr(response, "status", None)
+    if status_code is not None and status_code not in (200, 201, 202):
+        raise RuntimeError(
+            f"Kubernetes Binding API returned HTTP {status_code} "
+            f"for pod '{pod_name}'."
+        )
+
+    # Binding is asynchronous from the client's perspective. Verify that
+    # Kubernetes actually recorded the node assignment before reporting
+    # success to the scheduler.
+    deadline = time.time() + max(0.0, verify_timeout_sec)
+    last_seen_node = None
+    while time.time() < deadline:
+        try:
+            current = v1.read_namespaced_pod(
+                name=pod_name,
+                namespace=namespace,
+            )
+            last_seen_node = getattr(current.spec, "node_name", None)
+            if last_seen_node == actual_node_name:
+                print(
+                    f"Bound pod '{pod_name}' to logical node '{node_name}' "
+                    f"(Kubernetes node: '{actual_node_name}')"
+                )
+                return
+            if last_seen_node and last_seen_node != actual_node_name:
+                raise RuntimeError(
+                    f"Pod '{pod_name}' was assigned to unexpected Kubernetes "
+                    f"node '{last_seen_node}' instead of '{actual_node_name}'."
+                )
+        except ApiException as exc:
+            # A transient 404 immediately after the binding request is not
+            # treated as success; keep polling until the verification timeout.
+            if exc.status not in (404, 409):
+                raise
+        time.sleep(0.2)
+
+    raise TimeoutError(
+        f"Binding request for pod '{pod_name}' was submitted, but Kubernetes "
+        f"did not report spec.nodeName='{actual_node_name}' within "
+        f"{verify_timeout_sec:.1f}s (last seen: {last_seen_node!r})."
+    )
 
 
 def list_pending_unscheduled_pods(scheduler_name: str, namespace: str = DEFAULT_NAMESPACE):
@@ -250,6 +393,20 @@ def list_pending_unscheduled_pods(scheduler_name: str, namespace: str = DEFAULT_
         p for p in pods
         if p.spec.scheduler_name == scheduler_name and p.status.phase == "Pending" and not p.spec.node_name
     ]
+
+def get_pod_runtime_sec(k8s_pod_name: str, namespace: str = DEFAULT_NAMESPACE) -> Optional[float]:
+    """Observed wall-clock runtime of a finished pod (container start -> finish),
+    or None if the pod hasn't finished / the API is unavailable."""
+    try:
+        v1 = client.CoreV1Api()
+        pod = v1.read_namespaced_pod_status(name=k8s_pod_name, namespace=namespace)
+        for cs in (pod.status.container_statuses or []):
+            term = cs.state.terminated if cs.state else None
+            if term and term.started_at and term.finished_at:
+                return float((term.finished_at - term.started_at).total_seconds())
+    except Exception:
+        pass
+    return None
 
 
 def delete_pod(k8s_pod_name: str, namespace: str = DEFAULT_NAMESPACE) -> None:

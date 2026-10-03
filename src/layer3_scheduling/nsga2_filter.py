@@ -62,6 +62,8 @@ class CandidatePair:
 
     latency_penalty_sec: float
 
+    estimated_nsg_gco2: float = 0.0
+
     rank: int = 0
 
 
@@ -127,22 +129,20 @@ def _evaluate_pair(
     # Migration cost
     # ---------------------------------------------------------
 
-    migration = (
-        clark_model.estimate_migration_cost(
-            pod=pod,
-            source_node=current_node,
-            target_node=target_node,
-            source_region_ci=frame.current_region_ci,
+    if current_node.node_id == target_node.node_id:
+        migration_carbon = 0.0
+        migration_duration = 0.0
+    else:
+        migration = (
+            clark_model.estimate_migration_cost(
+                pod=pod,
+                source_node=current_node,
+                target_node=target_node,
+                source_region_ci=frame.current_region_ci,
+            )
         )
-    )
-
-    migration_carbon = (
-        migration.migration_carbon_gco2
-    )
-
-    migration_duration = (
-        migration.migration_duration_sec
-    )
+        migration_carbon = migration.migration_carbon_gco2
+        migration_duration = migration.migration_duration_sec
 
     total_carbon = (
         execution_carbon
@@ -150,7 +150,7 @@ def _evaluate_pair(
     )
 
     # ---------------------------------------------------------
-    # SLA
+    # SLA penalty: excess time beyond pod's own deadline
     # ---------------------------------------------------------
 
     total_duration = (
@@ -158,11 +158,32 @@ def _evaluate_pair(
         + scaled_duration
     )
 
+    # Latency penalty = excess beyond the pod's original duration deadline
     latency_penalty = max(
         0.0,
-        total_duration
-        - pod.sla_deadline_sec,
+        total_duration - pod.duration_sec,
     )
+
+    # --------------------------------------------------------
+    # Stay-baseline carbon (running on current node, no migration)
+    # --------------------------------------------------------
+
+    cpu_util_curr = min(
+        1.0,
+        pod.cpu_request / max(current_node.mips_rating / 1000.0, 0.001),
+    )
+    power_curr_w = kepler.estimate_pod_power(
+        cpu_util_curr,
+        pod.assigned_memory_gb,
+        current_node.idle_power_w,
+        current_node.max_power_w,
+    )
+    stay_carbon = (
+        power_curr_w * pod.duration_sec / 3_600_000.0
+    ) * frame.current_region_ci
+
+    # NSG = how much carbon we SAVE vs staying put
+    estimated_nsg = stay_carbon - total_carbon
 
     return (
         float(execution_carbon),
@@ -171,6 +192,7 @@ def _evaluate_pair(
         float(scaled_duration),
         float(migration_duration),
         float(latency_penalty),
+        float(estimated_nsg),
     )
 
 
@@ -299,6 +321,7 @@ class _BatchAssignmentProblem(
                 _scaled_duration,
                 _migration_duration,
                 latency_penalty,
+                _estimated_nsg,
             ) = _evaluate_pair(
                 pod=pod,
                 current_node=current_node,
@@ -412,6 +435,7 @@ class NSGA2PreFilter:
                 scaled_duration,
                 migration_duration,
                 latency_penalty,
+                estimated_nsg,
             ) = _evaluate_pair(
                 pod=pod,
                 current_node=current_node,
@@ -461,6 +485,11 @@ class NSGA2PreFilter:
                         latency_penalty,
                         4,
                     ),
+
+                    estimated_nsg_gco2=round(
+                        estimated_nsg,
+                        6,
+                    ),
                 )
             )
 
@@ -474,12 +503,12 @@ class NSGA2PreFilter:
     def _candidate_sort_key(
         candidate: CandidatePair,
     ):
-
-        # First prefer candidates with no SLA excess.
-        # Among those, lower estimated total carbon is preferred.
-        # Remaining ties are resolved using latency penalty.
+        # 1. No SLA penalty first
+        # 2. Highest estimated Net Sustainability Gain (-estimated_nsg_gco2)
+        # 3. Lowest estimated total carbon
         return (
             candidate.latency_penalty_sec > 0.0,
+            -candidate.estimated_nsg_gco2,
             candidate.estimated_total_carbon_gco2,
             candidate.latency_penalty_sec,
         )
@@ -503,6 +532,7 @@ class NSGA2PreFilter:
                 scaled_duration,
                 migration_duration,
                 latency_penalty,
+                estimated_nsg,
             ) = _evaluate_pair(
                 pod=pod,
                 current_node=current_node,
@@ -552,6 +582,11 @@ class NSGA2PreFilter:
                         latency_penalty,
                         4,
                     ),
+
+                    estimated_nsg_gco2=round(
+                        estimated_nsg,
+                        6,
+                    ),
                 )
             )
 
@@ -600,6 +635,62 @@ class NSGA2PreFilter:
             )
 
         return result
+
+    def quick_rank_single(self, frame: UnifiedTelemetryFrame) -> List[CandidatePair]:
+        all_nodes = frame.target_node_states
+        pod = frame.pod
+        eligible = [n for n in all_nodes if n.total_ram_gb >= pod.ram_request_gb] or [all_nodes[0]]
+        all_ranked = self._fallback_rank_single(pod, frame.current_node, frame, eligible)
+
+        if self.top_k <= 2:
+            ranked = all_ranked[:self.top_k]
+            if all(c.target_node.node_id != frame.current_node.node_id for c in ranked):
+                stay = self._fallback_rank_single(pod, frame.current_node, frame, [frame.current_node])
+                if stay:
+                    ranked = ranked[:1] + stay
+            for idx, c in enumerate(ranked):
+                c.rank = idx + 1
+            return ranked
+
+        # For top_k >= 3: ensure candidate diversity
+        # 1. Best global candidate (maximum NSG, greenest pool)
+        # 2. Best intermediate / alternative region or intra-region candidate
+        # 3. Stay baseline (current node)
+        best_cand = all_ranked[0] if all_ranked else None
+
+        intermediate_cand = None
+        for c in all_ranked[1:]:
+            if best_cand and c.target_node.region != best_cand.target_node.region and c.target_node.node_id != frame.current_node.node_id:
+                intermediate_cand = c
+                break
+        if not intermediate_cand and len(all_ranked) > 1:
+            for c in all_ranked[1:]:
+                if c.target_node.node_id != frame.current_node.node_id:
+                    intermediate_cand = c
+                    break
+
+        stay_cand = next((c for c in all_ranked if c.target_node.node_id == frame.current_node.node_id), None)
+        if not stay_cand:
+            stay_list = self._fallback_rank_single(pod, frame.current_node, frame, [frame.current_node])
+            stay_cand = stay_list[0] if stay_list else None
+
+        selected = []
+        if best_cand:
+            selected.append(best_cand)
+        if intermediate_cand and intermediate_cand.target_node.node_id not in [s.target_node.node_id for s in selected]:
+            selected.append(intermediate_cand)
+        if stay_cand and stay_cand.target_node.node_id not in [s.target_node.node_id for s in selected]:
+            selected.append(stay_cand)
+
+        for c in all_ranked:
+            if len(selected) >= self.top_k:
+                break
+            if c.target_node.node_id not in [s.target_node.node_id for s in selected]:
+                selected.append(c)
+
+        for idx, c in enumerate(selected):
+            c.rank = idx + 1
+        return selected[:self.top_k]
 
     def filter_and_rank_batch(
         self,
@@ -862,27 +953,36 @@ class NSGA2PreFilter:
 
         for pod in pods:
 
-            candidates = candidate_map[
-                pod.pod_id
-            ]
+            candidates = candidate_map[pod.pod_id]
 
-            candidates.sort(
-                key=self._candidate_sort_key
-            )
+            candidates.sort(key=self._candidate_sort_key)
+            candidates = candidates[: self.top_k]
 
-            for index, candidate in enumerate(
-                candidates
+            # The Layer 5/6 gate needs a "stay" baseline for every pod. If the
+            # shortlist dropped the pod's current node, put it in the LAST slot.
+            # Rank 1 (the capacity-aware NSGA-II choice) is never displaced.
+            idx = pods.index(pod)
+            current_id = current_nodes[idx].node_id
+            if self.top_k >= 2 and all(
+                c.target_node.node_id != current_id for c in candidates
             ):
+                stay = self._fallback_rank_single(
+                    pod, current_nodes[idx], frames[idx],
+                    [current_nodes[idx]],
+                )
+                if stay:
+                    if len(candidates) >= self.top_k:
+                        candidates[-1] = stay[0]
+                    else:
+                        candidates.append(stay[0])
+
+            for index, candidate in enumerate(candidates):
                 candidate.rank = index + 1
 
-            candidate_map[
-                pod.pod_id
-            ] = candidates[
-                : self.top_k
-            ]
+            candidate_map[pod.pod_id] = candidates
 
         return candidate_map
-
+    
     def filter_and_rank(
         self,
         frame: UnifiedTelemetryFrame,

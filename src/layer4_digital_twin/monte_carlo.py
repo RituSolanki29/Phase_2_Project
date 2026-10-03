@@ -138,6 +138,8 @@ class MonteCarloEngine:
             target_node,
         )
 
+        same_node = current_node.node_id == target_node.node_id
+
         # ---------------------------------------------------------
         # 1. BASELINE GBR PREDICTION
         # ---------------------------------------------------------
@@ -161,21 +163,21 @@ class MonteCarloEngine:
         )
 
         target_exec_std = max(
-            0.1,
+            0.5,
             baseline_std * mips_ratio,
+            predicted_target_exec_time * 0.08,
         )
 
         # ---------------------------------------------------------
         # 2. STAY EXECUTION DISTRIBUTION
         # ---------------------------------------------------------
 
-        # IMPORTANT:
         # Stay uses the baseline/source prediction and its own
         # uncertainty. It does NOT use target-scaled uncertainty.
 
         stay_exec_time_samples = rng.normal(
             loc=baseline_exec_time,
-            scale=max(0.1, baseline_std),
+            scale=max(0.5, baseline_std, baseline_exec_time * 0.08),
             size=self.num_runs,
         )
 
@@ -189,46 +191,60 @@ class MonteCarloEngine:
         # 3. TARGET EXECUTION DISTRIBUTION
         # ---------------------------------------------------------
 
-        target_exec_time_samples = rng.normal(
-            loc=predicted_target_exec_time,
-            scale=target_exec_std,
-            size=self.num_runs,
-        )
+        if same_node:
+            # Stay and target are the SAME physical placement, so they must
+            # share the same random draws (common random numbers). Drawing
+            # them independently made NSG for a stay candidate pure noise
+            # (mean != 0, P(NSG>0) ~ 0.5).
+            predicted_target_exec_time = baseline_exec_time
+            target_exec_std = max(0.5, baseline_std, baseline_exec_time * 0.08)
+            target_exec_time_samples = stay_exec_time_samples.copy()
+        else:
+            target_exec_time_samples = rng.normal(
+                loc=predicted_target_exec_time,
+                scale=target_exec_std,
+                size=self.num_runs,
+            )
 
-        target_exec_time_samples = np.clip(
-            target_exec_time_samples,
-            2.0,
-            None,
-        )
+            target_exec_time_samples = np.clip(
+                target_exec_time_samples,
+                2.0,
+                None,
+            )
 
         # ---------------------------------------------------------
         # 4. CLARK MIGRATION MODEL
         # ---------------------------------------------------------
 
-        migration_estimate = (
-            self.clark.estimate_migration_cost(
-                pod=pod,
-                source_node=current_node,
-                target_node=target_node,
-                source_region_ci=frame.current_region_ci,
+        if same_node:
+            from src.layer4_digital_twin.clark_model import MigrationCostEstimate
+            migration_estimate = MigrationCostEstimate(0.0, 0.0, 0.0, 0.0)
+
+            # Staying put costs exactly zero migration time.
+            migration_time_samples = np.zeros(self.num_runs, dtype=float)
+        else:
+            migration_estimate = (
+                self.clark.estimate_migration_cost(
+                    pod=pod,
+                    source_node=current_node,
+                    target_node=target_node,
+                    source_region_ci=frame.current_region_ci,
+                    is_new_placement=True,
+                )
             )
-        )
 
-        migration_time_samples = rng.normal(
-            loc=migration_estimate.migration_duration_sec,
-            scale=max(
-                0.05,
-                migration_estimate.migration_duration_sec
-                * 0.08,
-            ),
-            size=self.num_runs,
-        )
-
-        migration_time_samples = np.clip(
-            migration_time_samples,
-            0.0,
-            None,
-        )
+            migration_time_samples = np.clip(
+                rng.normal(
+                    loc=migration_estimate.migration_duration_sec,
+                    scale=max(
+                        0.1,
+                        migration_estimate.migration_duration_sec * 0.15,
+                    ),
+                    size=self.num_runs,
+                ),
+                0.0,
+                None,
+            )
 
         total_duration_samples = (
             migration_time_samples
@@ -247,12 +263,14 @@ class MonteCarloEngine:
             np.mean(target_exec_time_samples)
         )
 
+        pod_seed_offset = abs(hash(f"{pod.pod_id}_{target_node.node_id}")) % 10000
+
         current_trajectory = np.asarray(
             self.simpy_sampler.sample_carbon_trajectory(
                 region=current_node.region,
                 start_time_sec=frame.timestamp_sec,
                 duration_sec=current_duration_for_forecast,
-                random_seed=self.seed + 11,
+                random_seed=self.seed + 11 + (pod_seed_offset % 300),
             ),
             dtype=float,
         )
@@ -265,7 +283,7 @@ class MonteCarloEngine:
                     + migration_estimate.migration_duration_sec
                 ),
                 duration_sec=target_duration_for_forecast,
-                random_seed=self.seed + 29,
+                random_seed=self.seed + 29 + (pod_seed_offset % 300),
             ),
             dtype=float,
         )
@@ -278,13 +296,15 @@ class MonteCarloEngine:
             np.mean(target_trajectory)
         )
 
+        # Authentic grid forecast uncertainty: 12% to 15% standard error
+        # reflecting wind/solar intermittency and hourly marginal variation
         current_ci_std = max(
-            5.0,
+            current_ci_mean * 0.12,
             float(np.std(current_trajectory)),
         )
 
         target_ci_std = max(
-            5.0,
+            target_ci_mean * 0.14,
             float(np.std(target_trajectory)),
         )
 
@@ -369,27 +389,31 @@ class MonteCarloEngine:
             * sampled_current_cis
         )
 
-        target_execution_carbon_samples = (
-            target_energy_kwh
-            * sampled_target_cis
-        )
+        if same_node:
+            # Identical placement -> identical carbon, so NSG is exactly 0.
+            target_execution_carbon_samples = stay_carbon_samples.copy()
+            migration_carbon_samples = np.zeros(self.num_runs, dtype=float)
+        else:
+            target_execution_carbon_samples = (
+                target_energy_kwh
+                * sampled_target_cis
+            )
 
-        # Migration carbon uncertainty.
-        migration_carbon_std = max(
-            0.0001,
-            migration_estimate.migration_carbon_gco2
-            * 0.10,
-        )
+            # Migration carbon uncertainty.
+            migration_carbon_std = max(
+                0.0001,
+                migration_estimate.migration_carbon_gco2 * 0.10,
+            )
 
-        migration_carbon_samples = np.clip(
-            rng.normal(
-                migration_estimate.migration_carbon_gco2,
-                migration_carbon_std,
-                self.num_runs,
-            ),
-            0.0,
-            None,
-        )
+            migration_carbon_samples = np.clip(
+                rng.normal(
+                    migration_estimate.migration_carbon_gco2,
+                    migration_carbon_std,
+                    self.num_runs,
+                ),
+                0.0,
+                None,
+            )
 
         target_total_carbon_samples = (
             target_execution_carbon_samples

@@ -31,10 +31,17 @@ if __name__ == "__main__":
     parser.add_argument("--from-trace", default="data/borg_traces_data.csv")
     parser.add_argument("--count", type=int, default=5)
     parser.add_argument("--interval-sec", type=float, default=3.0, help="Delay between submissions, to watch the scheduler react one at a time.")
+    parser.add_argument("--balance-regions", action="store_true", help="Balance workload nominal regions evenly across DC_ASIA, DC_EU, and DC_US.")
     args = parser.parse_args()
 
     pods = TraceLoader(args.from_trace).load_trace_batch(limit=args.count, compression_factor=10.0)
-    for pod in pods:
+    regions = ["DC_ASIA", "DC_EU", "DC_US"]
+    for idx, pod in enumerate(pods):
+        if args.balance_regions:
+            region = regions[idx % len(regions)]
+            pod.source_region = region
+            region_prefix = region.split("_")[1].lower()
+            pod.source_node = f"{region_prefix}-node-{(idx % 3) + 1}"
         name = submit(pod)
-        print(f"Submitted {name} (pod_id={pod.pod_id}, nominal region={pod.source_region}) -- unscheduled, awaiting custom_scheduler.py")
+        print(f"Submitted {name} (pod_id={pod.pod_id}, nominal node={pod.source_node}, region={pod.source_region}) -- unscheduled, awaiting custom_scheduler.py")
         time.sleep(args.interval_sec)
